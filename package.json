@@ -29,7 +29,7 @@
     "elm",
     "wire-format"
   ],
-  "author": "Your Name",
+  "author": "sjalq",
   "license": "MIT",
   "peerDependencies": {
     "ws": "^8.0.0"
@@ -48,6 +48,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "your-repo-url"
+    "url": "https://github.com/sjalq/lamdera-websocket"
   }
 } 
