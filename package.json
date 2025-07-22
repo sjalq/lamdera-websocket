@@ -1,6 +1,6 @@
 {
   "name": "lamdera-websocket",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "WebSocket library for Lamdera with wire format handling for single String messages on 0x00 DU variants for ToFrontend and ToBackend messages",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
