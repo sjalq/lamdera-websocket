@@ -17,9 +17,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "npm run build:cjs && npm run build:esm",
-    "build:cjs": "node build-cjs.js",
-    "build:esm": "node build-esm.js",
+    "build": "node build.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -40,8 +38,7 @@
     }
   },
   "devDependencies": {
-    "typescript": "^5.0.0",
-    "ws": "^8.0.0"
+    "ws": "^8.18.3"
   },
   "engines": {
     "node": ">=16.0.0"
@@ -50,4 +47,4 @@
     "type": "git",
     "url": "https://github.com/sjalq/lamdera-websocket"
   }
-} 
+}
