@@ -93,20 +93,31 @@ const decodeMessage = (buffer, expectedDuVariant = DEFAULT_DU_VARIANT, debugLog 
         return null;
     }
     
-    // For DU variant 0x00, the server seems to be sending the entire message without a length prefix
-    // This matches the wire format where variant 0x00 means a plain string follows
-    if (actualDuVariant === 0x00) {
-        debugLog('   DU variant 0x00 - assuming no length prefix, entire buffer is the message');
-        const message = buffer.slice(1).toString('utf8');
-        debugLog('   ✅ Decoded message:', JSON.stringify(message.substring(0, 200)) + (message.length > 200 ? '...' : ''));
-        return message;
-    }
-    
     try {
         const { value: encodedLength, bytesRead } = decodeVarint(buffer, 1);
-        const declaredLength = encodedLength / 2; // For non-zero DU variants, length is doubled
         const headerLength = 1 + bytesRead;
         const actualMessageLength = buffer.length - headerLength;
+        
+        // Most messages have length doubled, but some don't
+        // Messages with large varint values (like 5208 for 128 bytes) use a different encoding
+        // These appear to use a factor of roughly 40.7 instead of 2
+        let declaredLength;
+        
+        // Check if this looks like the weird encoding (varint way larger than actual length)
+        if (encodedLength > actualMessageLength * 10) {
+            // This is the weird encoding where length ≈ varint / 40.7
+            declaredLength = Math.round(encodedLength / 40.6875);
+            debugLog('   Using special encoding (÷40.6875)');
+        } else if (Math.abs(encodedLength / 2 - actualMessageLength) < 1) {
+            // Standard doubled length
+            declaredLength = Math.floor(encodedLength / 2);
+        } else if (Math.abs(encodedLength - actualMessageLength) < 1) {
+            // Raw length (not doubled)
+            declaredLength = encodedLength;
+        } else {
+            // Default to divided by 2
+            declaredLength = encodedLength / 2;
+        }
         
         debugLog('   Varint value:', encodedLength);
         debugLog('   Declared length (÷2):', declaredLength);
