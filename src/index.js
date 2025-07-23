@@ -93,20 +93,29 @@ const decodeMessage = (buffer, expectedDuVariant = DEFAULT_DU_VARIANT, debugLog 
         return null;
     }
     
+    // For DU variant 0x00, the server seems to be sending the entire message without a length prefix
+    // This matches the wire format where variant 0x00 means a plain string follows
+    if (actualDuVariant === 0x00) {
+        debugLog('   DU variant 0x00 - assuming no length prefix, entire buffer is the message');
+        const message = buffer.slice(1).toString('utf8');
+        debugLog('   ✅ Decoded message:', JSON.stringify(message.substring(0, 200)) + (message.length > 200 ? '...' : ''));
+        return message;
+    }
+    
     try {
         const { value: encodedLength, bytesRead } = decodeVarint(buffer, 1);
-        const declaredLength = encodedLength / 2;
+        const declaredLength = encodedLength / 2; // For non-zero DU variants, length is doubled
         const headerLength = 1 + bytesRead;
         const actualMessageLength = buffer.length - headerLength;
         
-        debugLog('   Encoded length:', encodedLength);
+        debugLog('   Varint value:', encodedLength);
         debugLog('   Declared length (÷2):', declaredLength);
         debugLog('   Varint bytes used:', bytesRead);
         debugLog('   Header length:', headerLength);
         debugLog('   Actual message bytes available:', actualMessageLength);
         
         if (actualMessageLength < declaredLength) {
-            debugLog('   ❌ Not enough message bytes');
+            debugLog(`   ❌ Not enough message bytes: declared ${declaredLength}, available ${actualMessageLength} (short by ${declaredLength - actualMessageLength})`);
             return null;
         }
         
@@ -197,6 +206,7 @@ const getWebSocketImpl = async () => {
  * @param {Array} protocols - WebSocket protocols
  * @param {Object} options - Configuration options
  * @param {boolean} [options.debug=false] - Enable debug logging
+ * @param {number} [options.debugMaxChars=0] - Maximum characters to show in debug messages (0 = unlimited)
  * @param {number} [options.duVariant=0x00] - DU variant for message encoding
  * @param {number} [options.maxRetries=10] - Maximum retry attempts when becoming leader
  * @param {number} [options.retryBaseDelay=2000] - Base delay in ms for exponential backoff
@@ -216,6 +226,7 @@ class LamderaWebSocket {
         this.protocols = protocols;
         
         this.debug = options.debug || false;
+        this.debugMaxChars = options.debugMaxChars || 0;
         this.duVariant = options.duVariant || DEFAULT_DU_VARIANT;
         this.maxRetries = options.maxRetries || DEFAULT_MAX_RETRIES;
         this.retryBaseDelay = options.retryBaseDelay || DEFAULT_RETRY_BASE_DELAY;
@@ -264,8 +275,37 @@ class LamderaWebSocket {
     
     _debugLog(...args) {
         if (this.debug) {
-            console.log(...args);
+            const truncatedArgs = args.map(arg => {
+                if (typeof arg === 'string' && this.debugMaxChars > 0) {
+                    return arg.length > this.debugMaxChars 
+                        ? arg.substring(0, this.debugMaxChars) + '...'
+                        : arg;
+                } else if (typeof arg === 'object' && this.debugMaxChars > 0) {
+                    const jsonStr = JSON.stringify(arg);
+                    return jsonStr.length > this.debugMaxChars
+                        ? jsonStr.substring(0, this.debugMaxChars) + '...'
+                        : jsonStr;
+                }
+                return arg;
+            });
+            console.log(...truncatedArgs);
         }
+    }
+    
+    _getBoundedDebugLog() {
+        return (...args) => {
+            if (this.debug) {
+                const truncatedArgs = args.map(arg => {
+                    if (typeof arg === 'string' && this.debugMaxChars > 0) {
+                        return arg.length > this.debugMaxChars 
+                            ? arg.substring(0, this.debugMaxChars) + '...'
+                            : arg;
+                    }
+                    return arg;
+                });
+                console.log(...truncatedArgs);
+            }
+        };
     }
     
     async _initWebSocket() {
@@ -291,7 +331,7 @@ class LamderaWebSocket {
             
             this._ws.onmessage = (event) => {
                 this._debugLog('📨 Raw message received:', event.data);
-                const parsed = parseTransportMessage(event.data, this.duVariant, this._debugLog.bind(this));
+                const parsed = parseTransportMessage(event.data, this.duVariant, this._getBoundedDebugLog());
                 this._debugLog('🔍 Parsed message:', JSON.stringify(parsed, null, 2));
                 
                 if (parsed.type === 'protocol') {
