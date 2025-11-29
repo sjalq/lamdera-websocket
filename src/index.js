@@ -5,7 +5,15 @@ const SESSION_ID_RANGE = 990000;
 const SESSION_ID_PADDING_LENGTH = 40;
 const SESSION_ID_PADDING_CHARS = 'c04b8f7b594cdeedebc2a8029b82943b0a620815';
 const MIN_BUFFER_LENGTH = 2;
-const MAX_VARINT_BYTES = 5;
+
+// Wire3 encoding boundaries
+const WIRE3_ONE_BYTE_MAX = 215;
+const WIRE3_TWO_BYTE_MAX = 9431;
+const WIRE3_TWO_BYTE_OFFSET = 216;
+const WIRE3_MARKER_2_BYTES = 252;
+const WIRE3_MARKER_3_BYTES = 253;
+const WIRE3_MARKER_4_BYTES = 254;
+const WIRE3_MARKER_FLOAT64 = 255;
 
 // Default connection options
 const DEFAULT_MAX_RETRIES = 10;
@@ -35,107 +43,262 @@ const getBrowserCookie = () => {
     return null;
 };
 
-const encodeVarint = (value) => {
-    const bytes = [];
-    while (value >= 0x80) {
-        bytes.push((value & 0x7F) | 0x80);
-        value >>>= 7;
+// ============================================================================
+// Wire3 Integer Encoding/Decoding
+// ============================================================================
+
+/**
+ * Convert signed integer to unsigned using zigzag encoding.
+ * Positive n -> 2n (even), Negative n -> -2n-1 (odd)
+ * This ensures negative numbers don't require many bytes.
+ */
+const signedToUnsigned = (i) => {
+    if (i < 0) {
+        return -2 * i - 1;
     }
-    bytes.push(value & 0x7F);
-    return Buffer.from(bytes);
+    return 2 * i;
 };
 
-const decodeVarint = (buffer, offset = 0) => {
-    let result = 0;
-    let shift = 0;
-    let bytesRead = 0;
-    
-    for (let i = offset; i < buffer.length && bytesRead < MAX_VARINT_BYTES; i++, bytesRead++) {
-        const byte = buffer[i];
-        result |= (byte & 0x7F) << shift;
-        
-        if ((byte & 0x80) === 0) {
-            return { value: result, bytesRead: bytesRead + 1 };
+/**
+ * Convert unsigned integer back to signed (reverse zigzag).
+ */
+const unsignedToSigned = (i) => {
+    if (i % 2 === 1) {
+        return -Math.floor((i + 1) / 2);
+    }
+    return Math.floor(i / 2);
+};
+
+/**
+ * Encode an unsigned integer using Wire3 format.
+ *
+ * Wire3 varint format:
+ *   0-215:      1 byte  - raw value
+ *   216-9431:   2 bytes - [216 + (n-216)/256, (n-216) % 256]
+ *   <65536:     3 bytes - [252, high, low] (big-endian)
+ *   <16777216:  4 bytes - [253, b2, b1, b0] (big-endian)
+ *   <4294967296:5 bytes - [254, b3, b2, b1, b0] (big-endian)
+ *   else:       9 bytes - [255, ...float64 LE]
+ */
+const encodeUnsignedInt = (n) => {
+    if (n < 0) {
+        throw new Error(`encodeUnsignedInt requires non-negative integer, got ${n}`);
+    }
+
+    if (n <= WIRE3_ONE_BYTE_MAX) {
+        // 0-215: single byte
+        return Buffer.from([n]);
+    }
+
+    if (n <= WIRE3_TWO_BYTE_MAX) {
+        // 216-9431: two bytes
+        const adjusted = n - WIRE3_TWO_BYTE_OFFSET;
+        const b0 = WIRE3_TWO_BYTE_OFFSET + Math.floor(adjusted / 256);
+        const b1 = adjusted % 256;
+        return Buffer.from([b0, b1]);
+    }
+
+    if (n < 256 * 256) {
+        // <65536: marker 252 + 2 bytes big-endian
+        return Buffer.from([
+            WIRE3_MARKER_2_BYTES,
+            (n >> 8) & 0xFF,
+            n & 0xFF
+        ]);
+    }
+
+    if (n < 256 * 256 * 256) {
+        // <16777216: marker 253 + 3 bytes big-endian
+        return Buffer.from([
+            WIRE3_MARKER_3_BYTES,
+            (n >> 16) & 0xFF,
+            (n >> 8) & 0xFF,
+            n & 0xFF
+        ]);
+    }
+
+    if (n < 256 * 256 * 256 * 256) {
+        // <4294967296: marker 254 + 4 bytes big-endian
+        return Buffer.from([
+            WIRE3_MARKER_4_BYTES,
+            (n >> 24) & 0xFF,
+            (n >> 16) & 0xFF,
+            (n >> 8) & 0xFF,
+            n & 0xFF
+        ]);
+    }
+
+    // Larger values: marker 255 + float64 little-endian
+    const buf = Buffer.alloc(9);
+    buf[0] = WIRE3_MARKER_FLOAT64;
+    buf.writeDoubleLE(n, 1);
+    return buf;
+};
+
+/**
+ * Decode an unsigned integer from Wire3 format.
+ * Returns { value, bytesRead }.
+ */
+const decodeUnsignedInt = (buffer, offset = 0) => {
+    if (offset >= buffer.length) {
+        throw new Error('Buffer too short for Wire3 int decode');
+    }
+
+    const b0 = buffer[offset];
+
+    if (b0 <= WIRE3_ONE_BYTE_MAX) {
+        // 0-215: single byte
+        return { value: b0, bytesRead: 1 };
+    }
+
+    if (b0 < WIRE3_MARKER_2_BYTES) {
+        // 216-251: two byte encoding
+        if (offset + 1 >= buffer.length) {
+            throw new Error('Buffer too short for 2-byte Wire3 int');
         }
-        shift += 7;
+        const b1 = buffer[offset + 1];
+        const value = WIRE3_TWO_BYTE_OFFSET + (b0 - WIRE3_TWO_BYTE_OFFSET) * 256 + b1;
+        return { value, bytesRead: 2 };
     }
-    throw new Error('Invalid varint');
+
+    if (b0 === WIRE3_MARKER_2_BYTES) {
+        // 252: 2 bytes following (big-endian)
+        if (offset + 2 >= buffer.length) {
+            throw new Error('Buffer too short for marker-252 Wire3 int');
+        }
+        const value = (buffer[offset + 1] << 8) | buffer[offset + 2];
+        return { value, bytesRead: 3 };
+    }
+
+    if (b0 === WIRE3_MARKER_3_BYTES) {
+        // 253: 3 bytes following (big-endian)
+        if (offset + 3 >= buffer.length) {
+            throw new Error('Buffer too short for marker-253 Wire3 int');
+        }
+        const value = (buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3];
+        return { value, bytesRead: 4 };
+    }
+
+    if (b0 === WIRE3_MARKER_4_BYTES) {
+        // 254: 4 bytes following (big-endian)
+        // Use multiplication to avoid signed 32-bit overflow issues
+        if (offset + 4 >= buffer.length) {
+            throw new Error('Buffer too short for marker-254 Wire3 int');
+        }
+        const value = buffer[offset + 1] * 0x1000000 +
+                      buffer[offset + 2] * 0x10000 +
+                      buffer[offset + 3] * 0x100 +
+                      buffer[offset + 4];
+        return { value, bytesRead: 5 };
+    }
+
+    if (b0 === WIRE3_MARKER_FLOAT64) {
+        // 255: float64 following (little-endian)
+        if (offset + 8 >= buffer.length) {
+            throw new Error('Buffer too short for marker-255 Wire3 float64');
+        }
+        const value = buffer.readDoubleLE(offset + 1);
+        return { value: Math.floor(value), bytesRead: 9 };
+    }
+
+    throw new Error(`Invalid Wire3 int marker: ${b0}`);
 };
 
-const encodeMessage = (message, duVariant = DEFAULT_DU_VARIANT) => { 
-    const messageBuffer = Buffer.from(message, 'utf8');
-    const length = messageBuffer.length;
-    const lengthBuffer = encodeVarint(length * 2);
-    
+/**
+ * Encode a signed integer using Wire3 format (zigzag + unsigned encoding).
+ */
+const encodeInt64 = (signedValue) => {
+    const unsigned = signedToUnsigned(signedValue);
+    return encodeUnsignedInt(unsigned);
+};
+
+/**
+ * Decode a signed integer from Wire3 format.
+ * Returns { value, bytesRead }.
+ */
+const decodeInt64 = (buffer, offset = 0) => {
+    const { value: unsigned, bytesRead } = decodeUnsignedInt(buffer, offset);
+    return { value: unsignedToSigned(unsigned), bytesRead };
+};
+
+// Legacy aliases for compatibility
+const encodeVarint = encodeInt64;
+const decodeVarint = decodeInt64;
+
+// ============================================================================
+// Wire3 String Encoding/Decoding
+// ============================================================================
+
+/**
+ * Encode a string using Wire3 format: length (as signed int64) + UTF-8 bytes.
+ */
+const encodeString = (str) => {
+    const strBuffer = Buffer.from(str, 'utf8');
+    const lengthBuffer = encodeInt64(strBuffer.length);
+    return Buffer.concat([lengthBuffer, strBuffer]);
+};
+
+/**
+ * Decode a string from Wire3 format.
+ * Returns { value, bytesRead }.
+ */
+const decodeString = (buffer, offset = 0) => {
+    const { value: length, bytesRead: lengthBytes } = decodeInt64(buffer, offset);
+    const strStart = offset + lengthBytes;
+    const strEnd = strStart + length;
+
+    if (strEnd > buffer.length) {
+        throw new Error(`Buffer too short for string: need ${length} bytes, have ${buffer.length - strStart}`);
+    }
+
+    const value = buffer.slice(strStart, strEnd).toString('utf8');
+    return { value, bytesRead: lengthBytes + length };
+};
+
+// ============================================================================
+// Message Encoding (DU variant + string payload)
+// ============================================================================
+
+/**
+ * Encode a message with DU variant tag + Wire3 string.
+ */
+const encodeMessage = (message, duVariant = DEFAULT_DU_VARIANT) => {
+    const stringEncoded = encodeString(message);
     return Buffer.concat([
         Buffer.from([duVariant]),
-        lengthBuffer,
-        messageBuffer
+        stringEncoded
     ]);
 };
 
+/**
+ * Decode a message with DU variant tag + Wire3 string.
+ */
 const decodeMessage = (buffer, expectedDuVariant = DEFAULT_DU_VARIANT, debugLog = () => {}) => {
     debugLog('🔧 decodeMessage called:');
     debugLog('   Buffer length:', buffer.length);
     debugLog('   Buffer hex:', Array.from(buffer).map(b => b.toString(16).padStart(2, '0')).join(' '));
     debugLog('   Expected DuVariant:', expectedDuVariant);
-    
+
     if (buffer.length < MIN_BUFFER_LENGTH) {
         debugLog('   ❌ Buffer too short');
         return null;
     }
-    
+
     const actualDuVariant = buffer.readUInt8(0);
     debugLog('   Actual DuVariant:', actualDuVariant);
-    
+
     if (actualDuVariant !== expectedDuVariant) {
         debugLog('   ❌ DuVariant mismatch');
         return null;
     }
-    
+
     try {
-        const { value: encodedLength, bytesRead } = decodeVarint(buffer, 1);
-        const headerLength = 1 + bytesRead;
-        const actualMessageLength = buffer.length - headerLength;
-        
-        // Most messages have length doubled, but some don't
-        // Messages with large varint values (like 5208 for 128 bytes) use a different encoding
-        // These appear to use a factor of roughly 40.7 instead of 2
-        let declaredLength;
-        
-        // Check if this looks like the weird encoding (varint way larger than actual length)
-        if (encodedLength > actualMessageLength * 10) {
-            // This is the weird encoding where length ≈ varint / 40.7
-            declaredLength = Math.round(encodedLength / 40.6875);
-            debugLog('   Using special encoding (÷40.6875)');
-        } else if (Math.abs(encodedLength / 2 - actualMessageLength) < 1) {
-            // Standard doubled length
-            declaredLength = Math.floor(encodedLength / 2);
-        } else if (Math.abs(encodedLength - actualMessageLength) < 1) {
-            // Raw length (not doubled)
-            declaredLength = encodedLength;
-        } else {
-            // Default to divided by 2
-            declaredLength = encodedLength / 2;
-        }
-        
-        debugLog('   Varint value:', encodedLength);
-        debugLog('   Declared length (÷2):', declaredLength);
-        debugLog('   Varint bytes used:', bytesRead);
-        debugLog('   Header length:', headerLength);
-        debugLog('   Actual message bytes available:', actualMessageLength);
-        
-        if (actualMessageLength < declaredLength) {
-            debugLog(`   ❌ Not enough message bytes: declared ${declaredLength}, available ${actualMessageLength} (short by ${declaredLength - actualMessageLength})`);
-            return null;
-        }
-        
-        const message = buffer.slice(headerLength, headerLength + declaredLength).toString('utf8');
+        const { value: message, bytesRead } = decodeString(buffer, 1);
         debugLog('   ✅ Decoded message:', JSON.stringify(message));
-        
+        debugLog('   Total bytes read:', 1 + bytesRead);
         return message;
     } catch (e) {
-        debugLog('   ❌ Varint decode error:', e.message);
+        debugLog('   ❌ Decode error:', e.message);
         return null;
     }
 };
@@ -576,17 +739,49 @@ const createLamderaWebSocket = async (url, sessionId = generateSessionId()) => {
 };
 
 module.exports = {
+    // WebSocket client
     LamderaWebSocket,
+    createLamderaWebSocket,
+
+    // Session management
     generateSessionId,
     createSessionCookie,
     extractSessionFromCookie,
     getBrowserCookie,
+
+    // Wire3 integer encoding/decoding
+    signedToUnsigned,
+    unsignedToSigned,
+    encodeUnsignedInt,
+    decodeUnsignedInt,
+    encodeInt64,
+    decodeInt64,
+
+    // Legacy aliases
     encodeVarint,
     decodeVarint,
+
+    // Wire3 string encoding/decoding
+    encodeString,
+    decodeString,
+
+    // Message encoding (DU variant + payload)
     encodeMessage,
     decodeMessage,
+
+    // Transport layer
     createTransportMessage,
     parseTransportMessage,
+
+    // Utilities
     bufferToHex,
-    createLamderaWebSocket
+
+    // Constants (useful for testing)
+    WIRE3_ONE_BYTE_MAX,
+    WIRE3_TWO_BYTE_MAX,
+    WIRE3_TWO_BYTE_OFFSET,
+    WIRE3_MARKER_2_BYTES,
+    WIRE3_MARKER_3_BYTES,
+    WIRE3_MARKER_4_BYTES,
+    WIRE3_MARKER_FLOAT64
 }; 
